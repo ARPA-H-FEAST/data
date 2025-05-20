@@ -1,0 +1,77 @@
+import os
+
+# Define input and output directories
+INPUT_DIR = config["input_dir"]
+OUTPUT_DIR = config["output_dir"]
+REFERENCE_GENOME = "/data/lab/Homo_sapiens/bwa/hg38_no_chr.fa"
+KNOWN_SITES_VCF = "/data/lab/Homo_sapiens/bwa/dbsnp_146.hg38.vcf"
+
+# Get list of SRR directories
+srr_dirs = [d for d in os.listdir(INPUT_DIR) if os.path.isdir(os.path.join(INPUT_DIR, d)) and not d.startswith('.')]
+
+rule all:
+    input:
+        expand(os.path.join(OUTPUT_DIR, "{srr}", "{srr}_gatk_filt.vcf"), srr=srr_dirs)
+
+rule process_srr:
+    output:
+        os.path.join(OUTPUT_DIR, "{srr}", "{srr}_1.fastq.gz"),
+        os.path.join(OUTPUT_DIR, "{srr}", "{srr}_2.fastq.gz")
+    threads: 4
+    shell:
+        "module load sratoolkit/3.2.0 && "
+        "mkdir -p {OUTPUT_DIR}/{wildcards.srr} && "
+        "fasterq-dump --ngc /home/luke.johnson/cart/prj_35940_D43299.ngc --split-files --include-technical --progress --threads {threads} -O {OUTPUT_DIR}/{wildcards.srr} {wildcards.srr} && "
+        "gzip {OUTPUT_DIR}/{wildcards.srr}/*.fastq"
+
+rule align_reads:
+    input:
+        R1=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_1.fastq.gz"),
+        R2=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_2.fastq.gz")
+    output:
+        sorted_bam=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_sorted.bam"),
+        index=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_sorted.bam.bai")
+    threads: 8
+    shell:
+        "ml bwa samtools && "
+        "bwa mem -t {threads} {REFERENCE_GENOME} {input.R1} {input.R2} | "
+        "samtools view -@ {threads} -b - | "
+        "samtools sort -@ {threads} -o {output.sorted_bam} && "
+        "samtools index -@ {threads} {output.sorted_bam}"
+
+rule mark_duplicates:
+    input:
+        sorted_bam=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_sorted.bam"),
+        index=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_sorted.bam.bai")
+    output:
+        dedupped_bam=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_dedupped.bam"),
+        dedupped_index=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_dedupped.bam.bai"),
+        metrics=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_marked_dup_metrics.txt")
+    threads: 16
+    shell:
+        "ml samtools picardtools && "
+        "java -jar $PICARD MarkDuplicates I={input.sorted_bam} O={output.dedupped_bam} M={output.metrics} && "
+        "samtools index -@ {threads} {output.dedupped_bam} && "
+        "rm {input.sorted_bam} {input.index}"
+
+rule variant_calling:
+    input:
+        dedupped_bam=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_dedupped.bam"),
+        dedupped_index=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_dedupped.bam.bai")
+    output:
+        filtered_vcf=os.path.join(OUTPUT_DIR, "{srr}", "{srr}_gatk_filt.vcf")
+    threads: 16
+    shell:
+        "ml gatk samtools bcftools && "
+        "gatk AddOrReplaceReadGroups I={input.dedupped_bam} O={OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg.bam RGLB=lib1 RGPL=illumina RGPU=unit1 RGSM=20 && "
+        "samtools index -@ {threads} {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg.bam && "
+        "gatk BaseRecalibrator -I {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg.bam -R {REFERENCE_GENOME} --known-sites {KNOWN_SITES_VCF} -O {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_recal_data.table && "
+        "gatk ApplyBQSR -R {REFERENCE_GENOME} -I {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg.bam --bqsr-recal-file {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_recal_data.table -O {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg_bqcr.bam && "
+        "samtools index -@ {threads} {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg_bqcr.bam && "
+        "gatk --java-options '-Xmx4g' HaplotypeCaller -R {REFERENCE_GENOME} -I {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg_bqcr.bam -O {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_gatk.vcf -G StandardAnnotation -G StandardHCAnnotation && "
+        "bcftools view {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_gatk.vcf -Oz -o {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_gatk.vcf.gz && "
+        "bcftools index {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_gatk.vcf.gz && "
+        "bcftools filter -i 'TYPE=\"snp\" && MIN(INFO/DP)>=3 && QUAL>=100 && MQ==60' -r1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,X,Y {OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_gatk.vcf.gz -Ov -o {output.filtered_vcf} && "
+        "rm {input.dedupped_bam} {input.dedupped_index} "
+        "{OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg.bam "
+        "{OUTPUT_DIR}/{wildcards.srr}/{wildcards.srr}_dedupped_rg.bam.bai"
